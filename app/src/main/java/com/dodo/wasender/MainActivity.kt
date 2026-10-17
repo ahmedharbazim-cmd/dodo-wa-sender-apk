@@ -9,116 +9,38 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.Settings
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Toast
-import org.json.JSONArray
-import org.json.JSONObject
-import org.json.JSONTokener
-import java.io.File
 
 class MainActivity : Activity() {
 
-    private val waUrl = "https://web.whatsapp.com/"
-    private val desktopUa =
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-
-    private lateinit var wa: WebView
     private lateinit var panel: WebView
-    private var injectJs = ""
+    private lateinit var permBtn: Button
     private var chooserCb: ValueCallback<Array<Uri>>? = null
-    private var waOnTop = false
-
-    // ---------- tiny persistent store (replaces chrome.storage.local) ----------
-    private val lock = Any()
-    private var store = JSONObject()
-    private val storeFile by lazy { File(filesDir, "store.json") }
-    private val attFile by lazy { File(filesDir, "attachment.json") }
-
-    private fun loadStore() {
-        synchronized(lock) {
-            store = try { JSONObject(storeFile.readText()) } catch (e: Exception) { JSONObject() }
-            // never auto-resume a send after the app was closed
-            val st = store.optJSONObject("state")
-            if (st != null && st.optBoolean("running", false)) {
-                st.put("running", false)
-                st.put("status", "تم الإيقاف")
-                st.put("pendingNav", JSONObject.NULL)
-                persist()
-            }
-        }
-    }
-
-    private fun persist() {
-        try { storeFile.writeText(store.toString()) } catch (e: Exception) { }
-    }
-
-    private fun keysOf(json: String): List<String> {
-        return when (val v = JSONTokener(json).nextValue()) {
-            is String -> listOf(v)
-            is JSONArray -> (0 until v.length()).map { v.getString(it) }
-            else -> store.keys().asSequence().toList()
-        }
-    }
 
     inner class Bridge {
         @JavascriptInterface
-        fun get(keysJson: String): String {
-            synchronized(lock) {
-                val out = JSONObject()
-                for (k in keysOf(keysJson)) {
-                    if (k == "attachment") {
-                        if (attFile.exists()) {
-                            try { out.put(k, JSONObject(attFile.readText())) } catch (e: Exception) { }
-                        }
-                    } else if (store.has(k)) {
-                        out.put(k, store.get(k))
-                    }
-                }
-                return out.toString()
-            }
-        }
+        fun get(keysJson: String): String = Store.get(keysJson)
 
         @JavascriptInterface
-        fun set(objJson: String) {
-            synchronized(lock) {
-                val o = JSONObject(objJson)
-                val it = o.keys()
-                while (it.hasNext()) {
-                    val k = it.next()
-                    if (k == "attachment") {
-                        try { attFile.writeText(o.get(k).toString()) } catch (e: Exception) { }
-                    } else {
-                        store.put(k, o.get(k))
-                    }
-                }
-                persist()
-            }
-        }
+        fun set(objJson: String) = Store.set(objJson)
 
         @JavascriptInterface
-        fun remove(keysJson: String) {
-            synchronized(lock) {
-                for (k in keysOf(keysJson)) {
-                    if (k == "attachment") attFile.delete() else store.remove(k)
-                }
-                persist()
-            }
-        }
+        fun remove(keysJson: String) = Store.remove(keysJson)
 
+        /** Called by the panel's Start / Resume buttons. */
         @JavascriptInterface
         fun openWA() {
-            runOnUiThread { startWA() }
+            runOnUiThread { beginSend() }
         }
 
         @JavascriptInterface
@@ -144,8 +66,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        loadStore()
-        injectJs = assets.open("wa_inject.js").bufferedReader().use { it.readText() }
+        Store.init(this)
 
         val match = ViewGroup.LayoutParams.MATCH_PARENT
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -156,63 +77,63 @@ class MainActivity : Activity() {
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.HORIZONTAL
         bar.setBackgroundColor(Color.parseColor("#12332D"))
-        val b1 = Button(this)
-        b1.text = "لوحة التحكم"
-        val b2 = Button(this)
-        b2.text = "واتساب"
-        bar.addView(b1, LinearLayout.LayoutParams(0, wrap, 1f))
-        bar.addView(b2, LinearLayout.LayoutParams(0, wrap, 1f))
+        permBtn = Button(this)
+        val appBtn = Button(this)
+        appBtn.text = "إعدادات التطبيق"
+        bar.addView(permBtn, LinearLayout.LayoutParams(0, wrap, 1f))
+        bar.addView(appBtn, LinearLayout.LayoutParams(0, wrap, 1f))
 
-        val frame = FrameLayout(this)
-        wa = WebView(this)
         panel = WebView(this)
-        frame.addView(wa, FrameLayout.LayoutParams(match, match))
-        frame.addView(panel, FrameLayout.LayoutParams(match, match))
-
         root.addView(bar, LinearLayout.LayoutParams(match, wrap))
-        root.addView(frame, LinearLayout.LayoutParams(match, 0, 1f))
+        root.addView(panel, LinearLayout.LayoutParams(match, 0, 1f))
         setContentView(root)
 
-        setupWa()
         setupPanel()
-        b1.setOnClickListener { showPanel() }
-        b2.setOnClickListener { showWa() }
-        showPanel()
+        permBtn.setOnClickListener { openAccessibilitySettings() }
+        // On Android 13+ a sideloaded app needs "Allow restricted settings" (⋮ menu in App info)
+        appBtn.setOnClickListener {
+            try {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+            } catch (e: Exception) { }
+        }
+        refreshPermButton()
     }
 
-    private fun showPanel() { waOnTop = false; panel.bringToFront() }
-    private fun showWa() { waOnTop = true; wa.bringToFront() }
+    override fun onResume() {
+        super.onResume()
+        refreshPermButton()
+        // the service connects a moment after the user turns it on
+        permBtn.postDelayed({ refreshPermButton() }, 1000)
+    }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWa() {
-        val s = wa.settings
-        s.javaScriptEnabled = true
-        s.domStorageEnabled = true
-        s.databaseEnabled = true
-        s.userAgentString = desktopUa
-        s.useWideViewPort = true
-        s.loadWithOverviewMode = true
-        s.setSupportZoom(true)
-        s.builtInZoomControls = true
-        s.displayZoomControls = false
-        val cm = CookieManager.getInstance()
-        cm.setAcceptCookie(true)
-        cm.setAcceptThirdPartyCookies(wa, true)
-        wa.addJavascriptInterface(Bridge(), "AndroidStore")
-        wa.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView?, url: String?) {
-                if (view != null && url != null && url.startsWith(waUrl)) {
-                    view.evaluateJavascript(injectJs, null)
-                }
-            }
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val u = request?.url ?: return false
-                if (u.toString().startsWith("https://web.whatsapp.com")) return false
-                try { startActivity(Intent(Intent.ACTION_VIEW, u)) } catch (e: Exception) { }
-                return true
-            }
+    private fun refreshPermButton() {
+        val on = WaService.instance != null
+        permBtn.text = if (on) "الإذن مفعّل ✅" else "تفعيل إذن الإرسال ❌"
+    }
+
+    private fun openAccessibilitySettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (e: Exception) {
+            Toast.makeText(this, "افتح الإعدادات ← إمكانية الوصول ← DoDo WA Sender", Toast.LENGTH_LONG).show()
         }
-        wa.loadUrl(waUrl)
+    }
+
+    private fun beginSend() {
+        if (WaService.instance == null) {
+            Store.updateState { st ->
+                st.put("running", false)
+                st.put("status", "فعّل إذن الإرسال الأول (الزر فوق) وبعدين اضغط ابدأ")
+            }
+            Toast.makeText(
+                this,
+                "فعّل خدمة DoDo WA Sender من إمكانية الوصول. لو الزر رمادي: إعدادات التطبيق ← ⋮ ← السماح بالإعدادات المقيّدة",
+                Toast.LENGTH_LONG
+            ).show()
+            openAccessibilitySettings()
+            return
+        }
+        SendEngine.start()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -243,16 +164,6 @@ class MainActivity : Activity() {
         panel.loadUrl("file:///android_asset/panel/index.html")
     }
 
-    private fun startWA() {
-        showWa()
-        val u = wa.url
-        if (u != null && u.startsWith(waUrl) && wa.progress == 100) {
-            wa.evaluateJavascript(injectJs, null)
-        } else {
-            wa.loadUrl(waUrl)
-        }
-    }
-
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode == 77) {
@@ -261,15 +172,5 @@ class MainActivity : Activity() {
         } else {
             super.onActivityResult(requestCode, resultCode, data)
         }
-    }
-
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        if (waOnTop) showPanel() else super.onBackPressed()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        CookieManager.getInstance().flush()
     }
 }

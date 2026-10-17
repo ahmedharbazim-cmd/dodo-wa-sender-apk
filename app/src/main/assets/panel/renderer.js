@@ -3,7 +3,6 @@ window.addEventListener('error', e => showErr(e.message));
 window.addEventListener('unhandledrejection', e => showErr((e.reason && e.reason.message) || e.reason));
 const $ = id => document.getElementById(id);
 const MAX = 1000;
-const urlFor = it => `https://web.whatsapp.com/send?phone=${it.phone}&text=${encodeURIComponent(it.text)}`;
 
 function toAscii(s) {
   return s.replace(/[\u0660-\u0669]/g, d => d.charCodeAt(0) - 0x0660).replace(/[\u06F0-\u06F9]/g, d => d.charCodeAt(0) - 0x06F0);
